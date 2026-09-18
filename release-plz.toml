@@ -1,0 +1,4 @@
+[workspace]
+# Publish only when a release PR is merged, never just because the version in
+# Cargo.toml is not on crates.io yet (which would publish 0.1.0 on the first push).
+release_always = false

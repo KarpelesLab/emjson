@@ -2,47 +2,141 @@ name: CI
 
 on:
   push:
+    branches: [master]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: Test & lint (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        rust: [stable, "1.89"]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ matrix.rust }}
-      - run: cargo test --release --all-features
-      - run: cargo test --release --no-default-features
+      - uses: actions/checkout@v6
 
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
-      - run: cargo fmt --check
-      - run: cargo clippy --all-features --all-targets -- -D warnings
-      - run: cargo doc --all-features --no-deps
-        env:
-          RUSTDOCFLAGS: -D warnings
+          components: rustfmt, clippy
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+
+      - name: Format
+        if: runner.os == 'Linux' # formatting is platform-independent
+        run: cargo fmt --all --check
+
+      - name: Clippy (all features, warnings denied)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test (all features)
+        run: cargo test --all-features
+
+      - name: Test (no default features)
+        run: cargo test --no-default-features
 
   no_std:
+    name: no_std builds (${{ matrix.target }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        target: [thumbv6m-none-eabi, thumbv7em-none-eabihf, riscv32imc-unknown-none-elf]
+        # Bare-metal targets catch accidental `std`/`alloc` use; the 32-bit ones
+        # also catch 64-bit-only arithmetic. thumbv6m (Cortex-M0) has no atomics
+        # and no hardware division.
+        target: [thumbv6m-none-eabi, thumbv7em-none-eabi, riscv32imc-unknown-none-elf]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - run: cargo build --release --target ${{ matrix.target }}
-      - run: cargo build --release --target ${{ matrix.target }} --features embedded-io
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build (no default features)
+        run: cargo build --release --target ${{ matrix.target }} --no-default-features
+
+      - name: Build with embedded-io adapters
+        run: cargo build --release --target ${{ matrix.target }} --no-default-features --features embedded-io
+
+  msrv:
+    name: MSRV (Rust 1.89)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # Keep this pin in sync with `rust-version` in Cargo.toml.
+      - name: Install Rust 1.89 (declared MSRV)
+        uses: dtolnay/rust-toolchain@1.89
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      - name: Test (all features)
+        run: cargo test --all-features
+
+  docs:
+    name: Docs build (warnings denied)
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings -D rustdoc::broken-intra-doc-links
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo doc --no-deps --all-features
+        run: cargo doc --no-deps --all-features
+
+  lean_features:
+    # `--all-features` everywhere else would hide code, tests or doc links that
+    # only compile with some features. Check-only, so it is cheap.
+    name: Lean feature checks
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings -D rustdoc::broken-intra-doc-links
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: lean
+
+      - name: clippy + rustdoc, one feature at a time
+        run: |
+          set -euo pipefail
+          # Keep in sync with Cargo.toml's [features].
+          for f in "" std embedded-io; do
+            echo "::group::features: ${f:-none}"
+            cargo clippy --no-default-features ${f:+--features "$f"} --all-targets -- -D warnings
+            cargo doc --no-deps --no-default-features ${f:+--features "$f"}
+            echo "::endgroup::"
+          done

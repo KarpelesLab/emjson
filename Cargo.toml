@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Streaming JSON parser, writer and in-place editor for embedded systems: no_std, no alloc, a few hundred bytes of RAM"
+repository = "https://github.com/KarpelesLab/emjson"
 license = "MIT"
 readme = "README.md"
 keywords = ["json", "no_std", "embedded", "streaming", "parser"]
