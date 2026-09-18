@@ -1,0 +1,30 @@
+[package]
+name = "emjson"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Streaming JSON parser, writer and in-place editor for embedded systems: no_std, no alloc, a few hundred bytes of RAM"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["json", "no_std", "embedded", "streaming", "parser"]
+categories = ["no-std", "no-std::no-alloc", "embedded", "parser-implementations", "encoding"]
+
+[features]
+default = []
+# Adapters for std::io (Read/Write) and a `Storage` implementation for `std::fs::File`.
+std = []
+# Adapters for the embedded-io Read/Write traits.
+embedded-io = ["dep:embedded-io"]
+
+[dependencies]
+embedded-io = { version = "0.7", optional = true, default-features = false }
+
+[dev-dependencies]
+serde_json = "1"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[[example]]
+name = "big_file"
+required-features = ["std"]
