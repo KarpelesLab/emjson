@@ -20,7 +20,7 @@ use core::fmt;
 
 use crate::error::{Error, ErrorKind};
 use crate::io::{PipeError, Source, Tee, Write};
-use crate::number::fmt_u64;
+use crate::number::fmt_usize;
 use crate::parser::{Parser, Res};
 use crate::path::{Path, Seg};
 use crate::util::PipeResult;
@@ -351,7 +351,7 @@ fn write_key<W: Write>(w: &mut JsonWriter<W>, key: Seg<'_>) -> Result<(), W::Err
         Seg::Key(k) => w.key(k),
         Seg::Index(i) => {
             let mut buf = [0u8; 20];
-            let digits = fmt_u64(i as u64, &mut buf);
+            let digits = fmt_usize(i, &mut buf);
             w.key(core::str::from_utf8(digits).unwrap_or_default())
         }
         Seg::Pointer(mut rest) => {

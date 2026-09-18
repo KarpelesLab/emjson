@@ -4,7 +4,7 @@ use core::str::FromStr;
 use crate::Span;
 use crate::error::{Error, ErrorKind};
 use crate::io::{SliceSource, Source};
-use crate::number::fmt_u64;
+use crate::number::fmt_usize;
 use crate::path::{Path, Seg};
 use crate::stack::BitStack;
 use crate::string::{BufSink, KeyMatcher, NullSink};
@@ -491,7 +491,7 @@ impl<S: Source, const N: usize> Parser<S, N> {
         let (pat, escaped) = match *seg {
             Seg::Key(k) => (k.as_bytes(), false),
             Seg::Pointer(p) => (p.as_bytes(), true),
-            Seg::Index(i) => (fmt_u64(i as u64, &mut digits), false),
+            Seg::Index(i) => (fmt_usize(i, &mut digits), false),
         };
         self.open_key()?;
         let mut m = KeyMatcher::new(pat, escaped);

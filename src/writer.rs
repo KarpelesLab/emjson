@@ -4,7 +4,7 @@ use core::convert::Infallible;
 use core::fmt;
 
 use crate::io::{BufferFull, Counter, SliceWriter, Write};
-use crate::number::{fmt_u64, fmt_u128};
+use crate::number::{fmt_u32, fmt_u64, fmt_u128, fmt_usize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Pos {
@@ -255,36 +255,42 @@ impl<W: Write> JsonWriter<W> {
         self.pos = Pos::AfterValue;
     }
 
-    /// Writes an unsigned integer.
-    pub fn u64(&mut self, v: u64) -> Result<(), W::Error> {
-        let mut buf = [0u8; 20];
-        self.begin_raw()?;
-        self.out.write_all(fmt_u64(v, &mut buf))?;
-        self.end_raw();
-        Ok(())
-    }
-
-    /// Writes a signed integer.
-    pub fn i64(&mut self, v: i64) -> Result<(), W::Error> {
-        let mut buf = [0u8; 20];
-        self.begin_raw()?;
-        if v < 0 {
-            self.out.write_all(b"-")?;
-        }
-        self.out.write_all(fmt_u64(v.unsigned_abs(), &mut buf))?;
-        self.end_raw();
-        Ok(())
-    }
-
-    fn u128(&mut self, v: u128, neg: bool) -> Result<(), W::Error> {
-        let mut buf = [0u8; 40];
+    fn digits(&mut self, neg: bool, digits: &[u8]) -> Result<(), W::Error> {
         self.begin_raw()?;
         if neg {
             self.out.write_all(b"-")?;
         }
-        self.out.write_all(fmt_u128(v, &mut buf))?;
+        self.out.write_all(digits)?;
         self.end_raw();
         Ok(())
+    }
+
+    /// Writes an unsigned integer.
+    pub fn u32(&mut self, v: u32) -> Result<(), W::Error> {
+        self.digits(false, fmt_u32(v, &mut [0; 10]))
+    }
+
+    /// Writes a signed integer.
+    pub fn i32(&mut self, v: i32) -> Result<(), W::Error> {
+        self.digits(v < 0, fmt_u32(v.unsigned_abs(), &mut [0; 10]))
+    }
+
+    /// Writes an unsigned integer.
+    pub fn u64(&mut self, v: u64) -> Result<(), W::Error> {
+        self.digits(false, fmt_u64(v, &mut [0; 20]))
+    }
+
+    /// Writes a signed integer.
+    pub fn i64(&mut self, v: i64) -> Result<(), W::Error> {
+        self.digits(v < 0, fmt_u64(v.unsigned_abs(), &mut [0; 20]))
+    }
+
+    fn usize(&mut self, v: usize, neg: bool) -> Result<(), W::Error> {
+        self.digits(neg, fmt_usize(v, &mut [0; 20]))
+    }
+
+    fn u128(&mut self, v: u128, neg: bool) -> Result<(), W::Error> {
+        self.digits(neg, fmt_u128(v, &mut [0; 40]))
     }
 
     /// Writes a float in its shortest round-trip form. NaN and infinities, which JSON
@@ -403,8 +409,22 @@ macro_rules! impl_int {
     )*};
 }
 
-impl_int!(u64 as u64: u8, u16, u32, u64, usize);
-impl_int!(i64 as i64: i8, i16, i32, i64, isize);
+impl_int!(u32 as u32: u8, u16, u32);
+impl_int!(i32 as i32: i8, i16, i32);
+impl_int!(u64 as u64: u64);
+impl_int!(i64 as i64: i64);
+
+impl ToJson for usize {
+    fn to_json<W: Write>(&self, w: &mut JsonWriter<W>) -> Result<(), W::Error> {
+        w.usize(*self, false)
+    }
+}
+
+impl ToJson for isize {
+    fn to_json<W: Write>(&self, w: &mut JsonWriter<W>) -> Result<(), W::Error> {
+        w.usize(self.unsigned_abs(), *self < 0)
+    }
+}
 
 impl ToJson for u128 {
     fn to_json<W: Write>(&self, w: &mut JsonWriter<W>) -> Result<(), W::Error> {

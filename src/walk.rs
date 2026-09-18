@@ -166,7 +166,7 @@ fn next_index(path: &mut [u8], len: usize, first: bool) -> Option<usize> {
         (slash, v + 1)
     };
     let mut tmp = [0u8; 20];
-    let digits = crate::number::fmt_u64(idx as u64, &mut tmp);
+    let digits = crate::number::fmt_usize(idx, &mut tmp);
     let end = start + 1 + digits.len();
     let dst = path.get_mut(start..end)?;
     dst[0] = b'/';

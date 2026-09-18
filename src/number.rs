@@ -69,28 +69,34 @@ impl<S: Source, const N: usize> Parser<S, N> {
     }
 }
 
-/// Formats `v` in decimal at the end of `buf`, returning the digits.
-pub(crate) fn fmt_u64(mut v: u64, buf: &mut [u8; 20]) -> &[u8] {
-    let mut i = buf.len();
-    loop {
-        i -= 1;
-        buf[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-        if v == 0 {
-            return &buf[i..];
+macro_rules! fmt_uint {
+    ($name:ident, $t:ty) => {
+        /// Formats `v` in decimal at the end of `buf` (which must be large enough),
+        /// returning the digits.
+        pub(crate) fn $name(mut v: $t, buf: &mut [u8]) -> &[u8] {
+            let mut i = buf.len();
+            loop {
+                i -= 1;
+                buf[i] = b'0' + (v % 10) as u8;
+                v /= 10;
+                if v == 0 {
+                    return &buf[i..];
+                }
+            }
         }
-    }
+    };
 }
 
-/// Formats `v` in decimal at the end of `buf`, returning the digits.
-pub(crate) fn fmt_u128(mut v: u128, buf: &mut [u8; 40]) -> &[u8] {
-    let mut i = buf.len();
-    loop {
-        i -= 1;
-        buf[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-        if v == 0 {
-            return &buf[i..];
-        }
-    }
+// Separate widths so that 32-bit targets only link 64-bit division when 64-bit values
+// are actually formatted.
+fmt_uint!(fmt_u32, u32);
+fmt_uint!(fmt_u64, u64);
+fmt_uint!(fmt_u128, u128);
+
+/// Formats a `usize` with native-width arithmetic (`buf` must hold 20 bytes).
+pub(crate) fn fmt_usize(v: usize, buf: &mut [u8]) -> &[u8] {
+    #[cfg(target_pointer_width = "64")]
+    return fmt_u64(v as u64, buf);
+    #[cfg(not(target_pointer_width = "64"))]
+    return fmt_u32(v as u32, buf);
 }
