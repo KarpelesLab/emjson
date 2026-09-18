@@ -10,13 +10,11 @@ enum OwnedSeg {
     Index(usize),
 }
 
-/// All paths in `v`, as (JSON Pointer, segments, value).
-fn all_paths<'v>(
-    v: &'v Value,
-    ptr: String,
-    segs: Vec<(String, bool)>,
-    out: &mut Vec<(String, Vec<(String, bool)>, &'v Value)>,
-) {
+/// A path: JSON Pointer, segments (name, is_index), value.
+type PathInfo<'v> = (String, Vec<(String, bool)>, &'v Value);
+
+/// All paths in `v`.
+fn all_paths<'v>(v: &'v Value, ptr: String, segs: Vec<(String, bool)>, out: &mut Vec<PathInfo<'v>>) {
     out.push((ptr.clone(), segs.clone(), v));
     match v {
         Value::Array(a) => {

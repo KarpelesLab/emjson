@@ -89,7 +89,10 @@ impl<'r> Gen<'r> {
                 let s = self.random_string();
                 self.string(&s)
             }
-            2 => self.out.push_str(self.rng.pick(&["true", "false"])),
+            2 => {
+                let lit = *self.rng.pick::<&str>(&["true", "false"]);
+                self.out.push_str(lit)
+            }
             3 => self.out.push_str("null"),
             4 => {
                 self.out.push('[');
