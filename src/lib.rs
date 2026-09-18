@@ -103,3 +103,7 @@ impl Span {
         Some(usize::try_from(self.start).ok()?..usize::try_from(self.end).ok()?)
     }
 }
+
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
