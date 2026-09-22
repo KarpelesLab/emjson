@@ -1,3 +1,4 @@
+use core::cmp::Ordering;
 use core::fmt;
 use core::str::FromStr;
 
@@ -487,6 +488,26 @@ impl<S: Source, const N: usize> Parser<S, N> {
     }
 
     pub(crate) fn match_seg_key(&mut self, seg: &Seg<'_>) -> Res<bool, S> {
+        Ok(self.cmp_seg_key(seg)? == Ordering::Equal)
+    }
+
+    /// Reads the next object key and compares it with `name`, without any buffer.
+    ///
+    /// Returns the ordering of the key in the document relative to `name`, comparing the
+    /// decoded strings bytewise (which is Unicode code point order).
+    ///
+    /// ```
+    /// use core::cmp::Ordering;
+    /// let mut p = emjson::Parser::from_slice(br#"{"b\u00e9": 1}"#);
+    /// p.begin_object()?;
+    /// assert_eq!(p.cmp_key("b")?, Ordering::Greater);
+    /// # Ok::<(), emjson::Error<core::convert::Infallible>>(())
+    /// ```
+    pub fn cmp_key(&mut self, name: &str) -> Res<Ordering, S> {
+        self.cmp_seg_key(&Seg::Key(name))
+    }
+
+    pub(crate) fn cmp_seg_key(&mut self, seg: &Seg<'_>) -> Res<Ordering, S> {
         let mut digits = [0u8; 20];
         let (pat, escaped) = match *seg {
             Seg::Key(k) => (k.as_bytes(), false),
@@ -497,7 +518,7 @@ impl<S: Source, const N: usize> Parser<S, N> {
         let mut m = KeyMatcher::new(pat, escaped);
         self.decode(&mut m)?;
         self.state = State::ObjColon;
-        Ok(m.matched())
+        Ok(m.ordering())
     }
 
     pub(crate) fn find_member(&mut self, seg: &Seg<'_>) -> Res<bool, S> {

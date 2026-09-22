@@ -1,7 +1,9 @@
 mod common;
 
 use common::*;
-use emjson::edit::{CapacityError, Editor, MemStorage, Op, Storage, apply_copy, copy_edit, plan, plan_remove};
+use emjson::edit::{
+    CapacityError, Editor, MemStorage, Op, Placement, Storage, apply_copy, copy_edit, plan, plan_remove, plan_with,
+};
 use emjson::io::{ReadSource, Write};
 use emjson::{Error, Parser, RawJson, SliceSource, Span};
 use serde_json::Value;
@@ -105,15 +107,47 @@ fn edit_all_ways(doc: &str, op: Option<Op>, path: &str, new: &str, scratch_size:
         assert_eq!(result.len() as i64 - doc.len() as i64, patch.delta(&value));
     }
 
-    // Single pass through a tiny buffer.
+    // Single pass through a tiny buffer: new members go at the end, like the editor with
+    // `Placement::End` (and the two-pass copy with that placement).
     if let Some(op) = op {
+        let mut buf = vec![0u8; doc.len() + new.len() + 64];
+        buf[..doc.len()].copy_from_slice(doc.as_bytes());
+        let mut scratch = vec![0u8; scratch_size];
+        let mut ed = Editor::new(MemStorage::new(&mut buf, doc.len()), &mut scratch).with_placement(Placement::End);
+        assert_eq!(ed.edit(op, path, &value).unwrap(), applied);
+        let at_end = ed.storage().as_bytes().to_vec();
+        let patch = plan_with(&mut Parser::from_slice(doc.as_bytes()), op, path, Placement::End).unwrap();
+        if let Some(patch) = patch {
+            let mut out = VecWriter(Vec::new());
+            apply_copy(SliceSource::new(doc.as_bytes()), &mut out, &patch, &value).unwrap();
+            assert_eq!(out.0, at_end, "apply_copy (end) differs for {op:?} {path}");
+        }
+
         let mut rbuf = [0u8; 3];
         let mut out = VecWriter(Vec::new());
         let found = copy_edit(ReadSource::new(doc.as_bytes(), &mut rbuf), &mut out, op, path, &value).unwrap();
         assert_eq!(found, applied);
-        assert_eq!(out.0, result, "copy_edit differs for {op:?} {path}");
+        assert_eq!(out.0, at_end, "copy_edit differs for {op:?} {path}");
+        assert_eq!(parse(&at_end), parse(&result), "placements disagree on content for {op:?} {path}");
     }
     applied.then_some(result)
+}
+
+/// Member names of the object at `ptr`, in document order.
+fn keys_at(doc: &[u8], ptr: &str) -> Vec<String> {
+    let mut p = Parser::from_slice(doc);
+    assert!(p.seek(ptr).unwrap());
+    p.begin_object().unwrap();
+    let mut keys = Vec::new();
+    let mut buf = [0u8; 1024];
+    while p.has_next().unwrap() {
+        keys.push(p.read_key(&mut buf).unwrap().to_string());
+    }
+    keys
+}
+
+fn pointer_token(key: &str) -> String {
+    key.replace('~', "~0").replace('/', "~1")
 }
 
 fn parse(bytes: &[u8]) -> Value {
@@ -174,13 +208,25 @@ fn random_edits() {
             let target = value.pointer(ptr).unwrap();
             match target {
                 Value::Object(m) => {
-                    let key = "new~/key";
-                    let new_ptr = format!("{ptr}/new~0~1key");
-                    let out = edit_all_ways(&doc, Some(Op::Set), &new_ptr, new, scratch).unwrap();
-                    let mut expected = value.clone();
-                    expected.pointer_mut(ptr).unwrap().as_object_mut().unwrap().insert(key.into(), new_value.clone());
-                    assert_eq!(parse(&out), expected, "set {new_ptr}\n{doc}");
-                    assert!(!m.contains_key(key));
+                    let before = keys_at(doc.as_bytes(), ptr);
+                    for key in ["new~/key", "", "a", "zzzz", "\u{e9}t\u{e9}", "\u{1f600}", "~1"] {
+                        if m.contains_key(key) {
+                            continue;
+                        }
+                        let new_ptr = format!("{ptr}/{}", pointer_token(key));
+                        for op in [Op::Set, Op::Insert] {
+                            let out = edit_all_ways(&doc, Some(op), &new_ptr, new, scratch).unwrap();
+                            let mut expected = value.clone();
+                            let obj = expected.pointer_mut(ptr).unwrap().as_object_mut().unwrap();
+                            obj.insert(key.into(), new_value.clone());
+                            assert_eq!(parse(&out), expected, "{op:?} {new_ptr}\n{doc}");
+                            // Sorted placement: before the first greater name.
+                            let mut keys = before.clone();
+                            let at = keys.iter().position(|k| k.as_str() > key).unwrap_or(keys.len());
+                            keys.insert(at, key.to_string());
+                            assert_eq!(keys_at(&out, ptr), keys, "{op:?} {new_ptr}\n{doc}");
+                        }
+                    }
                     // Push only works on arrays.
                     assert!(edit_all_ways(&doc, Some(Op::Push), ptr, new, scratch).is_none());
                     counts[2] += 1;
@@ -247,8 +293,8 @@ fn readme_flow() {
     );
     assert!(ed.replace("/config/items", &[9u8; 0]).unwrap());
     assert!(ed.remove("/tail").unwrap());
-    assert!(ed.set("/config/count", &0).unwrap());
-    assert_eq!(ed.storage().as_bytes(), br#"{"config": {"name": "a much longer name", "items": [],"count":0}}"#);
+    assert!(ed.set("/config/count", &0).unwrap()); // before "name", the first greater name
+    assert_eq!(ed.storage().as_bytes(), br#"{"config": {"count":0,"name": "a much longer name", "items": []}}"#);
     assert!(!ed.replace("/nope", &1).unwrap());
     assert!(!ed.remove("/config/nope").unwrap());
 }
@@ -340,4 +386,86 @@ fn file_storage() {
     file.read_to_string(&mut s).unwrap();
     assert_eq!(s, r#"{"list": [2, 3,4], "name": "x"}"#);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+fn edit_str(doc: &str, f: impl FnOnce(&mut Editor<'_, MemStorage<'_>>)) -> String {
+    let mut buf = doc.as_bytes().to_vec();
+    buf.resize(doc.len() + 256, 0);
+    let mut scratch = [0u8; 4];
+    let mut ed = Editor::new(MemStorage::new(&mut buf, doc.len()), &mut scratch);
+    f(&mut ed);
+    String::from_utf8(ed.storage().as_bytes().to_vec()).unwrap()
+}
+
+#[test]
+fn sorted_member_insertion() {
+    // Builds a sorted object from any insertion order.
+    let out = edit_str("{}", |ed| {
+        for k in ["m", "c", "x", "a", "d", "b", "\u{e9}", "Z", ""] {
+            assert!(ed.set(&[k], &k).unwrap());
+        }
+    });
+    assert_eq!(out, r#"{"":"","Z":"Z","a":"a","b":"b","c":"c","d":"d","m":"m","x":"x","é":"é"}"#);
+
+    // Keys with escapes are compared decoded; prefixes sort first.
+    let doc = r#"{"a\u0062": 1, "abc": 2, "a\/": 3}"#;
+    assert_eq!(edit_str(doc, |ed| assert!(ed.set("/aa", &0).unwrap())), r#"{"aa":0,"a\u0062": 1, "abc": 2, "a\/": 3}"#);
+    assert_eq!(
+        edit_str(doc, |ed| assert!(ed.set("/aba", &0).unwrap())),
+        r#"{"a\u0062": 1, "aba":0,"abc": 2, "a\/": 3}"#
+    );
+    // An existing member is found even past the insertion point of an unsorted object.
+    assert_eq!(edit_str(doc, |ed| assert!(ed.set("/a~1", &0).unwrap())), r#"{"a\u0062": 1, "abc": 2, "a\/": 0}"#);
+    assert_eq!(edit_str(doc, |ed| assert!(ed.insert(&["ab"], &0).unwrap())), r#"{"a\u0062": 0, "abc": 2, "a\/": 3}"#);
+    // Numeric segments name members in objects.
+    assert_eq!(
+        edit_str(r#"{"1": 1, "3": 3}"#, |ed| assert!(ed.set(emjson::path![2], &2).unwrap())),
+        r#"{"1": 1, "2":2,"3": 3}"#
+    );
+    // An invalid pointer escape is a literal `~`, both when writing and when matching.
+    let out = edit_str("{}", |ed| {
+        assert!(ed.set("/a~2", &1).unwrap());
+        assert!(ed.set("/a~2", &2).unwrap());
+    });
+    assert_eq!(out, r#"{"a~2":2}"#);
+
+    // Pretty-printed documents.
+    let doc = "{\n  \"b\": 1,\n  \"d\": 2\n}";
+    assert_eq!(edit_str(doc, |ed| assert!(ed.set("/c", &0).unwrap())), "{\n  \"b\": 1,\n  \"c\":0,\"d\": 2\n}");
+    assert_eq!(edit_str(doc, |ed| assert!(ed.set("/a", &0).unwrap())), "{\n  \"a\":0,\"b\": 1,\n  \"d\": 2\n}");
+    assert_eq!(edit_str(doc, |ed| assert!(ed.set("/e", &0).unwrap())), "{\n  \"b\": 1,\n  \"d\": 2\n,\"e\":0}");
+
+    // Placement::End appends.
+    let out = edit_str(r#"{"b": 1}"#, |ed| {
+        ed.set_placement(Placement::End);
+        assert_eq!(ed.placement(), Placement::End);
+        assert!(ed.set("/a", &0).unwrap());
+    });
+    assert_eq!(out, r#"{"b": 1,"a":0}"#);
+}
+
+#[test]
+fn array_insert_and_remove() {
+    let doc = "[1, 2, 3]";
+    assert_eq!(edit_str(doc, |ed| assert!(ed.insert("/0", &0).unwrap())), "[0,1, 2, 3]");
+    assert_eq!(edit_str(doc, |ed| assert!(ed.insert("/2", &9).unwrap())), "[1, 2, 9,3]");
+    assert_eq!(edit_str(doc, |ed| assert!(ed.insert("/3", &4).unwrap())), "[1, 2, 3,4]");
+    assert_eq!(edit_str(doc, |ed| assert!(ed.insert("/-", &4).unwrap())), "[1, 2, 3,4]");
+    assert_eq!(edit_str(doc, |ed| assert!(!ed.insert("/4", &4).unwrap())), doc);
+    assert_eq!(edit_str("[]", |ed| assert!(ed.insert("/0", "x").unwrap())), r#"["x"]"#);
+    assert_eq!(edit_str(doc, |ed| assert!(ed.remove("/0").unwrap())), "[2, 3]");
+    assert_eq!(edit_str(doc, |ed| assert!(ed.remove("/1").unwrap())), "[1, 3]");
+    assert_eq!(edit_str(doc, |ed| assert!(ed.remove("/2").unwrap())), "[1, 2]");
+    assert_eq!(edit_str(doc, |ed| assert!(!ed.remove("/3").unwrap())), doc);
+    assert_eq!(edit_str(doc, |ed| assert!(!ed.remove("/-").unwrap())), doc);
+    // Emptying and refilling.
+    let out = edit_str(doc, |ed| {
+        for _ in 0..3 {
+            assert!(ed.remove("/0").unwrap());
+        }
+        assert!(!ed.remove("/0").unwrap());
+        assert!(ed.insert("/0", &7).unwrap());
+        assert!(ed.insert("/0", &6).unwrap());
+    });
+    assert_eq!(out, "[6,7]");
 }

@@ -8,14 +8,18 @@
 //!   flash, ...) in place: locate, measure, move the tail, write. Memory used: the parser
 //!   (~16 bytes) plus a caller-provided scratch buffer of any size.
 //! - [`copy_edit`]: single pass over a stream, writing the modified document to a
-//!   [`Write`]r (replace / set / insert / push).
+//!   [`Write`]r (replace / set / insert / push; new members go at the end of objects).
 //! - [`plan`] / [`plan_remove`] + [`apply_copy`]: two passes over any [`Source`], for
 //!   all operations including removal.
+//!
+//! New object members are placed according to [`Placement`]: by default before the
+//! first member whose name sorts after theirs, which keeps sorted objects sorted.
 //!
 //! In-place edits are not atomic: if interrupted (power loss) while the tail is being
 //! moved, the document is corrupted. Use the copy functions to write a new file and swap
 //! it in when that matters.
 
+use core::cmp::Ordering;
 use core::fmt;
 
 use crate::error::{Error, ErrorKind};
@@ -249,21 +253,37 @@ pub enum Op {
     /// Replace an existing value. Nothing happens if the path does not exist.
     Replace,
     /// Replace the value if it exists, otherwise create it: add the member to its parent
-    /// object, or append the element if the last segment is the array length or `-`.
-    /// The parent must exist.
+    /// object (where [`Placement`] says), or append the element if the last segment is
+    /// the array length or `-`. The parent must exist.
     Set,
-    /// Like [`Op::Set`] for objects; in arrays, insert before the element at that index
+    /// Like [`Op::Set`] for objects (an existing member is replaced, a new one is placed
+    /// according to [`Placement`]); in arrays, insert before the element at that index
     /// (shifting the following elements), or append for the array length or `-`.
     Insert,
     /// Append the value to the array at the path.
     Push,
 }
 
+/// Where [`Op::Set`] and [`Op::Insert`] put a member that does not exist yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Placement {
+    /// Before the first member whose name sorts after the new one (comparing names
+    /// bytewise, i.e. by Unicode code point), or at the end if there is none. In an object
+    /// whose names are sorted, this keeps them sorted.
+    ///
+    /// The whole object is still scanned, so an existing member is found and replaced even
+    /// if the object is not sorted.
+    #[default]
+    Sorted,
+    /// After the last member.
+    End,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind<'k> {
     Value,
     Remove,
-    Member { lead: bool, key: Seg<'k> },
+    Member { lead: bool, trail: bool, key: Seg<'k> },
     Element { lead: bool, trail: bool },
 }
 
@@ -325,12 +345,16 @@ impl<V: ToJson + ?Sized> ToJson for Content<'_, '_, V> {
         match self.kind {
             Kind::Value => w.value(self.value),
             Kind::Remove => Ok(()),
-            Kind::Member { lead, key } => {
+            Kind::Member { lead, trail, key } => {
                 if lead {
                     w.raw_fragment(b",")?;
                 }
                 write_key(w, key)?;
-                w.value(self.value)
+                w.value(self.value)?;
+                if trail {
+                    w.raw_fragment(b",")?;
+                }
+                Ok(())
             }
             Kind::Element { lead, trail } => {
                 if lead {
@@ -388,11 +412,14 @@ struct Target<'k> {
     kind: Kind<'k>,
 }
 
-/// Finds where `op` applies. On success the parser has consumed exactly up to `start`.
+/// Finds where `op` applies. On success the parser has consumed exactly up to `start`,
+/// except for a new member with [`Placement::Sorted`], which is only known after
+/// scanning the whole object.
 fn locate<'k, S: Source, const N: usize, P: Path + ?Sized>(
     p: &mut Parser<S, N>,
     op: Op,
     path: &'k P,
+    placement: Placement,
 ) -> Res<Option<Target<'k>>, S> {
     let value_here = |p: &mut Parser<S, N>| -> Res<Option<Target<'k>>, S> {
         Ok(Some(Target { start: p.offset(), replace: true, kind: Kind::Value }))
@@ -421,22 +448,31 @@ fn locate<'k, S: Source, const N: usize, P: Path + ?Sized>(
         Token::BeginObject => {
             p.begin_object()?;
             let mut any = false;
+            // Offset of the first member sorting after the new one.
+            let mut before = None;
             loop {
                 match p.peek()? {
                     Token::Key => {
-                        if p.match_seg_key(&last)? {
-                            p.peek()?;
-                            return value_here(p);
+                        let start = p.offset();
+                        match p.cmp_seg_key(&last)? {
+                            Ordering::Equal => {
+                                p.peek()?;
+                                return value_here(p);
+                            }
+                            Ordering::Greater if placement == Placement::Sorted && before.is_none() => {
+                                before = Some(start);
+                            }
+                            _ => {}
                         }
                         p.skip_value()?;
                         any = true;
                     }
                     _ => {
-                        return Ok(Some(Target {
-                            start: p.offset(),
-                            replace: false,
-                            kind: Kind::Member { lead: any, key: last },
-                        }));
+                        let (start, kind) = match before {
+                            Some(s) => (s, Kind::Member { lead: false, trail: true, key: last }),
+                            None => (p.offset(), Kind::Member { lead: any, trail: false, key: last }),
+                        };
+                        return Ok(Some(Target { start, replace: false, kind }));
                     }
                 }
             }
@@ -478,12 +514,38 @@ fn locate<'k, S: Source, const N: usize, P: Path + ?Sized>(
 /// Computes the [`Patch`] for `op` at `path`, reading the document with `p` (positioned
 /// before the root value). Returns `None` if the operation does not apply (path not
 /// found, parent missing or not a container, index out of range...).
+///
+/// New object members are placed with [`Placement::Sorted`]; see [`plan_with`].
 pub fn plan<'k, S: Source, const N: usize, P: Path + ?Sized>(
     p: &mut Parser<S, N>,
     op: Op,
     path: &'k P,
 ) -> Res<Option<Patch<'k>>, S> {
-    let Some(t) = locate(p, op, path)? else { return Ok(None) };
+    plan_with(p, op, path, Placement::Sorted)
+}
+
+/// Like [`plan`], placing new object members according to `placement`.
+///
+/// ```
+/// use emjson::Parser;
+/// use emjson::edit::{Placement, apply_copy, plan_with};
+/// use emjson::io::SliceWriter;
+///
+/// let doc = br#"{"a": 1, "c": 3}"#;
+/// let patch = plan_with(&mut Parser::from_slice(doc), emjson::edit::Op::Set, "/b", Placement::Sorted)?.unwrap();
+/// let mut out = [0u8; 32];
+/// let mut dst = SliceWriter::new(&mut out);
+/// apply_copy(emjson::SliceSource::new(doc), &mut dst, &patch, &2).unwrap();
+/// assert_eq!(dst.written(), br#"{"a": 1, "b":2,"c": 3}"#);
+/// # Ok::<(), emjson::Error<core::convert::Infallible>>(())
+/// ```
+pub fn plan_with<'k, S: Source, const N: usize, P: Path + ?Sized>(
+    p: &mut Parser<S, N>,
+    op: Op,
+    path: &'k P,
+    placement: Placement,
+) -> Res<Option<Patch<'k>>, S> {
+    let Some(t) = locate(p, op, path, placement)? else { return Ok(None) };
     let end = if t.replace { p.value_span()?.end } else { t.start };
     Ok(Some(Patch { start: t.start, end, kind: t.kind }))
 }
@@ -690,6 +752,10 @@ pub fn apply_copy<S: Source, W: Write, V: ToJson + ?Sized>(
 /// Memory use is the parser (default 64 nesting levels) plus whatever buffer `src` has.
 /// Returns whether the operation applied; if not, the output is an exact copy.
 ///
+/// A single pass cannot look ahead for an existing member, so new object members are
+/// always added at the end ([`Placement::End`]). For sorted placement, use [`plan`] and
+/// [`apply_copy`] (two passes).
+///
 /// ```
 /// use emjson::edit::{copy_edit, Op};
 /// use emjson::io::{ReadSource, SliceWriter};
@@ -709,7 +775,7 @@ pub fn copy_edit<S: Source, W: Write, P: Path + ?Sized, V: ToJson + ?Sized>(
     value: &V,
 ) -> PipeResult<bool, S, W> {
     let mut p = Parser::new(Tee::new(src, dst));
-    let target = locate(&mut p, op, path)?;
+    let target = locate(&mut p, op, path, Placement::End)?;
     let found = target.is_some();
     if let Some(t) = target {
         p.source_mut().set_enabled(false).map_err(Error::Io)?;
@@ -747,6 +813,7 @@ pub fn copy_edit<S: Source, W: Write, P: Path + ?Sized, V: ToJson + ?Sized>(
 pub struct Editor<'s, St, const N: usize = 8> {
     st: St,
     scratch: &'s mut [u8],
+    placement: Placement,
 }
 
 impl<'s, St: Storage> Editor<'s, St> {
@@ -761,7 +828,40 @@ impl<'s, St: Storage, const N: usize> Editor<'s, St, N> {
     /// Creates an editor whose parser has a nesting stack of `N` bytes (`8 * N` levels).
     pub fn with_stack(storage: St, scratch: &'s mut [u8]) -> Self {
         assert!(!scratch.is_empty(), "Editor needs a non-empty scratch buffer");
-        Self { st: storage, scratch }
+        Self { st: storage, scratch, placement: Placement::Sorted }
+    }
+
+    /// Sets where [`set`](Self::set) and [`insert`](Self::insert) put new object members
+    /// (default: [`Placement::Sorted`]).
+    ///
+    /// ```
+    /// use emjson::edit::{Editor, MemStorage, Placement};
+    ///
+    /// let mut buf = [0u8; 64];
+    /// buf[..8].copy_from_slice(br#"{"b": 1}"#);
+    /// let mut scratch = [0u8; 8];
+    /// let mut ed = Editor::new(MemStorage::new(&mut buf, 8), &mut scratch);
+    /// ed.set("/c", &3)?;
+    /// ed.set("/a", &0)?;
+    /// assert_eq!(ed.storage().as_bytes(), br#"{"a":0,"b": 1,"c":3}"#);
+    /// ed.set_placement(Placement::End);
+    /// ed.set("/0", &4)?;
+    /// assert_eq!(ed.storage().as_bytes(), br#"{"a":0,"b": 1,"c":3,"0":4}"#);
+    /// # Ok::<(), emjson::Error<emjson::edit::CapacityError>>(())
+    /// ```
+    pub fn set_placement(&mut self, placement: Placement) {
+        self.placement = placement;
+    }
+
+    /// Builder form of [`set_placement`](Self::set_placement).
+    pub fn with_placement(mut self, placement: Placement) -> Self {
+        self.placement = placement;
+        self
+    }
+
+    /// Where new object members are placed.
+    pub fn placement(&self) -> Placement {
+        self.placement
     }
 
     /// The storage.
@@ -800,7 +900,8 @@ impl<'s, St: Storage, const N: usize> Editor<'s, St, N> {
         path: &P,
         value: &V,
     ) -> Result<bool, Error<St::Error>> {
-        let Some(patch) = self.parse(|p| plan(p, op, path))? else { return Ok(false) };
+        let placement = self.placement;
+        let Some(patch) = self.parse(|p| plan_with(p, op, path, placement))? else { return Ok(false) };
         self.apply(&patch, value)?;
         Ok(true)
     }
@@ -819,7 +920,9 @@ impl<'s, St: Storage, const N: usize> Editor<'s, St, N> {
         self.edit(Op::Set, path, value)
     }
 
-    /// Inserts the value at `path` (see [`Op::Insert`]).
+    /// Inserts the value at `path` (see [`Op::Insert`]): in an array, before the element
+    /// at that index (or at the end for the length or `-`); in an object, as the member
+    /// with that name, placed according to [`placement`](Self::placement).
     pub fn insert<P: Path + ?Sized, V: ToJson + ?Sized>(
         &mut self,
         path: &P,
@@ -837,7 +940,8 @@ impl<'s, St: Storage, const N: usize> Editor<'s, St, N> {
         self.edit(Op::Push, path, value)
     }
 
-    /// Removes the member or element at `path`. Returns `false` if it does not exist.
+    /// Removes the member or element at `path` (with its separating comma). Returns
+    /// `false` if it does not exist.
     pub fn remove<P: Path + ?Sized>(&mut self, path: &P) -> Result<bool, Error<St::Error>> {
         let Some(patch) = self.parse(|p| plan_remove(p, path))? else { return Ok(false) };
         self.apply(&patch, &())?;

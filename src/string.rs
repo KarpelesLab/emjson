@@ -1,5 +1,7 @@
 //! String decoding: escapes, UTF-8 validation, and the sinks decoded bytes go to.
 
+use core::cmp::Ordering;
+
 use crate::error::ErrorKind;
 use crate::io::Source;
 use crate::parser::{Parser, Res};
@@ -54,35 +56,47 @@ impl Sink for BufSink<'_> {
 }
 
 /// Compares decoded bytes with a pattern, optionally JSON-Pointer-escaped (`~0`, `~1`).
+///
+/// Tracks the ordering of the decoded key relative to the pattern (bytewise, i.e. by
+/// Unicode code point). An invalid escape in the pattern (`~` not followed by `0` or `1`)
+/// stands for a literal `~`, as when the key is written.
 pub(crate) struct KeyMatcher<'p> {
     pat: &'p [u8],
     pos: usize,
     escaped: bool,
-    ok: bool,
+    ord: Ordering,
 }
 
 impl<'p> KeyMatcher<'p> {
     pub(crate) fn new(pat: &'p [u8], escaped: bool) -> Self {
-        Self { pat, pos: 0, escaped, ok: true }
+        Self { pat, pos: 0, escaped, ord: Ordering::Equal }
     }
 
     fn next_pat(&mut self) -> Option<u8> {
         let b = *self.pat.get(self.pos)?;
         self.pos += 1;
-        if b != b'~' {
+        if !self.escaped || b != b'~' {
             return Some(b);
         }
-        let e = *self.pat.get(self.pos)?;
-        self.pos += 1;
-        match e {
-            b'0' => Some(b'~'),
-            b'1' => Some(b'/'),
-            _ => None,
+        match self.pat.get(self.pos) {
+            Some(b'0') => {
+                self.pos += 1;
+                Some(b'~')
+            }
+            Some(b'1') => {
+                self.pos += 1;
+                Some(b'/')
+            }
+            _ => Some(b'~'),
         }
     }
 
-    pub(crate) fn matched(&self) -> bool {
-        self.ok && self.pos == self.pat.len()
+    /// Ordering of the decoded key relative to the pattern, once the key is complete.
+    pub(crate) fn ordering(&self) -> Ordering {
+        match self.ord {
+            Ordering::Equal if self.pos < self.pat.len() => Ordering::Less,
+            o => o,
+        }
     }
 }
 
@@ -92,22 +106,27 @@ impl Sink for KeyMatcher<'_> {
         usize::MAX
     }
     fn put(&mut self, bytes: &[u8]) {
-        if !self.ok {
+        if self.ord != Ordering::Equal {
             return;
         }
         if !self.escaped {
             let end = self.pos + bytes.len();
             if self.pat.get(self.pos..end) == Some(bytes) {
                 self.pos = end;
-            } else {
-                self.ok = false;
+                return;
             }
-            return;
         }
         for &b in bytes {
-            if self.next_pat() != Some(b) {
-                self.ok = false;
-                return;
+            match self.next_pat() {
+                Some(p) if p == b => {}
+                Some(p) => {
+                    self.ord = b.cmp(&p);
+                    return;
+                }
+                None => {
+                    self.ord = Ordering::Greater;
+                    return;
+                }
             }
         }
     }

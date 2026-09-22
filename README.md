@@ -152,6 +152,28 @@ assert_eq!(
 );
 ```
 
+New object members are inserted in sorted position by default: before the first
+member whose name sorts after theirs, which keeps sorted objects sorted (the whole object
+is still scanned, so an existing member is always replaced, never duplicated).
+`ed.set_placement(Placement::End)` appends them instead. In arrays, `insert("/list/1", v)`
+inserts before element 1 (`-` or the length appends), and `remove` deletes an element or
+member together with its comma.
+
+```rust
+use emjson::edit::{Editor, MemStorage};
+
+let mut buf = [0u8; 64];
+let doc = br#"{"b": 1, "d": [1, 3]}"#;
+buf[..doc.len()].copy_from_slice(doc);
+let mut scratch = [0u8; 16];
+let mut ed = Editor::new(MemStorage::new(&mut buf, doc.len()), &mut scratch);
+ed.set("/c", &2).unwrap();
+ed.insert("/a", &0).unwrap();
+ed.insert("/d/1", &2).unwrap();
+ed.remove("/d/0").unwrap();
+assert_eq!(ed.storage().as_bytes(), br#"{"a":0,"b": 1, "c":2,"d": [2,3]}"#);
+```
+
 The building blocks are public: `Parser::value_span` gives the exact range of a value,
 `encoded_len` the size of its replacement, and `Editor::splice` / `edit::apply` perform
 the move-and-write. `edit::plan` computes a `Patch` without applying it, e.g. to check
@@ -160,7 +182,9 @@ that it fits first.
 ## Editing while copying a stream
 
 When the document cannot be modified in place (read-only source, or you want an atomic
-file swap), `copy_edit` applies the change in a single pass while copying:
+file swap), `copy_edit` applies the change in a single pass while copying (new object
+members go at the end, since a single pass cannot look ahead; `plan` + `apply_copy`
+places them in sorted position):
 
 ```rust
 use emjson::edit::{copy_edit, Op};
